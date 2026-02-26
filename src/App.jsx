@@ -3,23 +3,24 @@ import { useState, useRef, useEffect, useCallback } from "react";
 const MODELS = [
   {
     id: "LiquidAI/LFM2.5-1.2B-Thinking-ONNX",
+    type: "thinking",
     label: "1.2B Thinking",
     desc: "Reasoning model with chain-of-thought",
     size: "~600MB",
   },
   {
     id: "LiquidAI/LFM2.5-VL-1.6B-ONNX",
+    type: "vl",
     label: "VL 1.6B",
-    desc: "Vision-language — coming soon",
-    size: "~800MB",
-    disabled: true,
+    desc: "Vision-language text chat",
+    size: "~1.5GB",
   },
   {
     id: "LiquidAI/LFM2.5-Audio-1.5B-ONNX",
+    type: "audio",
     label: "Audio 1.5B",
-    desc: "Audio — coming soon",
-    size: "~750MB",
-    disabled: true,
+    desc: "Text chat + speech output",
+    size: "~1.8GB",
   },
 ];
 
@@ -43,6 +44,19 @@ function getModelInfo(id) {
 
 // Check cache for a single model directly from main thread
 async function isModelCached(modelId) {
+  const model = MODELS.find((m) => m.id === modelId);
+  // ONNX RT models (VL, Audio) — check for decoder file in Cache API
+  if (model?.type !== "thinking") {
+    try {
+      const cache = await caches.open("onnx-model-cache");
+      const base = `https://huggingface.co/${modelId}/resolve/main/onnx`;
+      const hit = await cache.match(`${base}/decoder_q4.onnx`);
+      return !!hit;
+    } catch {
+      return false;
+    }
+  }
+  // Thinking model uses transformers.js Cache API
   try {
     const cache = await caches.open("transformers-cache");
     const keys = await cache.keys();
@@ -185,6 +199,56 @@ function AssistantMessage({ content, isStreaming }) {
   );
 }
 
+function AudioMessage({ waveform, sampleRate }) {
+  const [playing, setPlaying] = useState(false);
+  const audioCtxRef = useRef(null);
+
+  const play = useCallback(() => {
+    if (playing || !waveform) return;
+    setPlaying(true);
+    try {
+      const ctx = audioCtxRef.current || new AudioContext({ sampleRate: sampleRate || 24000 });
+      audioCtxRef.current = ctx;
+      const buffer = ctx.createBuffer(1, waveform.length, sampleRate || 24000);
+      buffer.getChannelData(0).set(waveform);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.onended = () => setPlaying(false);
+      source.start();
+    } catch (err) {
+      console.error("Audio playback error:", err);
+      setPlaying(false);
+    }
+  }, [waveform, sampleRate, playing]);
+
+  const duration = waveform ? (waveform.length / (sampleRate || 24000)).toFixed(1) : 0;
+
+  return (
+    <div className="message message-audio">
+      <button
+        onClick={play}
+        disabled={playing || !waveform}
+        className="inline-flex items-center gap-2 px-4 py-2 bg-neutral-800 text-white rounded-lg text-sm font-medium hover:bg-neutral-700 transition-colors disabled:opacity-50"
+      >
+        {playing ? (
+          <>
+            <span className="inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+            Playing...
+          </>
+        ) : (
+          <>
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
+              <path d="M3 2.5v9l8-4.5z" />
+            </svg>
+            Play Audio ({duration}s)
+          </>
+        )}
+      </button>
+    </div>
+  );
+}
+
 function DownloadIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="inline-block ml-1 align-[-1px]">
@@ -199,11 +263,9 @@ function ModelPills({ activeId, cachedModels, onSelect, disabled }) {
       {MODELS.map((m) => {
         const isActive = m.id === activeId;
         const isCached = cachedModels[m.id];
-        const isComingSoon = m.disabled;
 
         let cls = "model-pill";
-        if (isComingSoon) cls += " model-pill-soon";
-        else if (isActive) cls += " model-pill-active";
+        if (isActive) cls += " model-pill-active";
         else if (isCached) cls += " model-pill-cached";
         else cls += " model-pill-download";
 
@@ -211,18 +273,30 @@ function ModelPills({ activeId, cachedModels, onSelect, disabled }) {
           <button
             key={m.id}
             onClick={() => onSelect(m.id)}
-            disabled={disabled || isActive || isComingSoon}
+            disabled={disabled || isActive}
             className={cls}
             title={m.desc}
           >
             {m.label}
-            {isComingSoon && <span className="ml-1 text-[10px]">soon</span>}
-            {!isActive && !isCached && !isComingSoon && <DownloadIcon />}
+            {!isActive && !isCached && <DownloadIcon />}
           </button>
         );
       })}
     </div>
   );
+}
+
+// Create worker for the given model — Vite requires static new URL() paths
+function createModelWorker(modelId) {
+  const model = MODELS.find((m) => m.id === modelId);
+  switch (model?.type) {
+    case "vl":
+      return new Worker(new URL("./worker-vl.js", import.meta.url), { type: "module" });
+    case "audio":
+      return new Worker(new URL("./worker-audio.js", import.meta.url), { type: "module" });
+    default:
+      return new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+  }
 }
 
 function checkWebGPU() {
@@ -283,6 +357,14 @@ export default function App() {
       case "token": {
         streamRef.current += data.text;
         const text = streamRef.current;
+        // If audio started, show a generating indicator
+        if (data.audioStarted) {
+          setMessages((prev) => [
+            ...prev,
+            { role: "audio-pending", content: "Generating speech..." },
+          ]);
+          break;
+        }
         setMessages((prev) => {
           const updated = [...prev];
           const last = updated[updated.length - 1];
@@ -296,6 +378,16 @@ export default function App() {
         setStats({ tokensPerSec: data.tokensPerSec, tokenCount: data.tokenCount });
         break;
       }
+      case "audio_data":
+        // Replace audio-pending message with playable audio
+        setMessages((prev) => {
+          const updated = prev.filter((m) => m.role !== "audio-pending");
+          return [
+            ...updated,
+            { role: "audio", waveform: new Float32Array(data.waveform), sampleRate: data.sampleRate },
+          ];
+        });
+        break;
       case "tool_call":
         setMessages((prev) => [
           ...prev,
@@ -312,6 +404,8 @@ export default function App() {
           tokenCount: data.tokenCount,
           elapsed: data.elapsed,
         });
+        // Remove any leftover audio-pending messages
+        setMessages((prev) => prev.filter((m) => m.role !== "audio-pending"));
         setTimeout(() => inputRef.current?.focus(), 100);
         break;
       case "error":
@@ -320,7 +414,7 @@ export default function App() {
         setGenerating(false);
         break;
     }
-  }, []);
+  }, [modelId]);
 
   // Create worker and load/check model
   useEffect(() => {
@@ -340,9 +434,7 @@ export default function App() {
     isModelCached(modelId).then((cached) => {
       if (cancelled) return;
 
-      const worker = new Worker(new URL("./worker.js", import.meta.url), {
-        type: "module",
-      });
+      const worker = createModelWorker(modelId);
       worker.addEventListener("message", handleWorkerMessage);
       workerRef.current = worker;
 
@@ -370,9 +462,7 @@ export default function App() {
     setStatusText("Downloading model...");
     // Worker might not exist yet if we went straight to idle
     if (!workerRef.current) {
-      const worker = new Worker(new URL("./worker.js", import.meta.url), {
-        type: "module",
-      });
+      const worker = createModelWorker(modelId);
       worker.addEventListener("message", handleWorkerMessage);
       workerRef.current = worker;
     }
@@ -398,10 +488,13 @@ export default function App() {
     setGenerating(true);
     setStats(null);
 
+    // Only send standard chat roles to the worker (filter out audio/audio-pending)
     workerRef.current?.postMessage({
       type: "generate",
       data: {
-        messages: newMessages.map(({ role, content }) => ({ role, content })),
+        messages: newMessages
+          .filter((m) => ["user", "assistant", "system", "tool"].includes(m.role))
+          .map(({ role, content }) => ({ role, content })),
         maxTokens: 2048,
         temperature: 0.7,
       },
@@ -547,6 +640,13 @@ export default function App() {
                     ) : msg.role === "tool" ? (
                       <div key={i} className="message message-tool">
                         <span className="tool-label">tool</span> {msg.content}
+                      </div>
+                    ) : msg.role === "audio" ? (
+                      <AudioMessage key={i} waveform={msg.waveform} sampleRate={msg.sampleRate} />
+                    ) : msg.role === "audio-pending" ? (
+                      <div key={i} className="message message-assistant">
+                        <span className="text-neutral-400 text-xs font-medium">Generating speech</span>
+                        <PulseDots />
                       </div>
                     ) : (
                       <AssistantMessage

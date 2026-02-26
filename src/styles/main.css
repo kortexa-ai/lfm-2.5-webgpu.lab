@@ -117,8 +117,10 @@
   @apply bg-white text-neutral-400 border-neutral-200 hover:border-neutral-400;
 }
 
-.model-pill-soon {
-  @apply bg-neutral-50 text-neutral-300 border-neutral-100 cursor-not-allowed;
+/* Audio message */
+.message-audio {
+  @apply bg-emerald-50 border border-emerald-200 self-start rounded-bl-md;
+  animation: fade-up 0.3s ease-out;
 }
 
 /* Progress bar */
