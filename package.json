@@ -1,0 +1,24 @@
+{
+  "name": "@kortexa-ai/lfm-2-5-webgpu.lab",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "vite",
+    "dev": "vite",
+    "build": "vite build --mode production",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.0.0-next.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.7",
+    "@vitejs/plugin-react-swc": "^4.2.2",
+    "tailwindcss": "^4.1.7",
+    "vite": "^7.2.4",
+    "vite-plugin-mkcert": "^1.17.9"
+  }
+}

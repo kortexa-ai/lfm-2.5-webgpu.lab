@@ -1,0 +1,9 @@
+# Lab fragment: lfm-2-5-webgpu served at /lfm-2-5-webgpu/
+location = /lfm-2-5-webgpu {
+    return 302 /lfm-2-5-webgpu/;
+}
+
+location /lfm-2-5-webgpu/ {
+    alias /home/francip/src/lfm-2.5-webgpu.lab/dist/;
+    try_files $uri $uri/ /lfm-2-5-webgpu/index.html;
+}
