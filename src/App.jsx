@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 
 const MODELS = [
   {
@@ -145,6 +145,20 @@ function cleanSpecialTokens(text) {
     .trim();
 }
 
+function ImageLightbox({ src, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div className="lightbox" onClick={onClose}>
+      <img src={src} className="lightbox-img" onClick={(e) => e.stopPropagation()} />
+    </div>
+  );
+}
+
 function ThinkingBlock({ thinking }) {
   const [open, setOpen] = useState(false);
 
@@ -201,50 +215,105 @@ function AssistantMessage({ content, isStreaming }) {
 
 function AudioMessage({ waveform, sampleRate }) {
   const [playing, setPlaying] = useState(false);
+  const [progress, setProgress] = useState(0);
   const audioCtxRef = useRef(null);
+  const rafRef = useRef(null);
+  const startTimeRef = useRef(0);
+
+  const rate = sampleRate || 24000;
+  const duration = waveform ? waveform.length / rate : 0;
+
+  // Downsample waveform into bars
+  const NUM_BARS = 50;
+  const bars = useMemo(() => {
+    if (!waveform || waveform.length === 0) return [];
+    const step = waveform.length / NUM_BARS;
+    const result = [];
+    for (let i = 0; i < NUM_BARS; i++) {
+      const start = Math.floor(i * step);
+      const end = Math.floor((i + 1) * step);
+      let max = 0;
+      for (let j = start; j < end; j++) {
+        const abs = Math.abs(waveform[j]);
+        if (abs > max) max = abs;
+      }
+      result.push(max);
+    }
+    const peak = Math.max(...result, 0.01);
+    return result.map((v) => v / peak);
+  }, [waveform]);
 
   const play = useCallback(() => {
     if (playing || !waveform) return;
     setPlaying(true);
+    setProgress(0);
     try {
-      const ctx = audioCtxRef.current || new AudioContext({ sampleRate: sampleRate || 24000 });
+      const ctx = audioCtxRef.current || new AudioContext({ sampleRate: rate });
       audioCtxRef.current = ctx;
-      const buffer = ctx.createBuffer(1, waveform.length, sampleRate || 24000);
+      const buffer = ctx.createBuffer(1, waveform.length, rate);
       buffer.getChannelData(0).set(waveform);
       const source = ctx.createBufferSource();
       source.buffer = buffer;
       source.connect(ctx.destination);
-      source.onended = () => setPlaying(false);
+      source.onended = () => {
+        setPlaying(false);
+        setProgress(0);
+        cancelAnimationFrame(rafRef.current);
+      };
+      startTimeRef.current = ctx.currentTime;
       source.start();
+
+      // Animate progress
+      const tick = () => {
+        const elapsed = ctx.currentTime - startTimeRef.current;
+        setProgress(Math.min(elapsed / duration, 1));
+        if (elapsed < duration) rafRef.current = requestAnimationFrame(tick);
+      };
+      rafRef.current = requestAnimationFrame(tick);
     } catch (err) {
       console.error("Audio playback error:", err);
       setPlaying(false);
     }
-  }, [waveform, sampleRate, playing]);
+  }, [waveform, rate, playing, duration]);
 
-  const duration = waveform ? (waveform.length / (sampleRate || 24000)).toFixed(1) : 0;
+  useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
+
+  const playedBars = Math.floor(progress * NUM_BARS);
 
   return (
     <div className="message message-audio">
-      <button
-        onClick={play}
-        disabled={playing || !waveform}
-        className="inline-flex items-center gap-2 px-4 py-2 bg-neutral-800 text-white rounded-lg text-sm font-medium hover:bg-neutral-700 transition-colors disabled:opacity-50"
-      >
-        {playing ? (
-          <>
-            <span className="inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
-            Playing...
-          </>
-        ) : (
-          <>
+      <div className="waveform-row" onClick={!playing ? play : undefined}>
+        <button className="waveform-play" disabled={playing || !waveform}>
+          {playing ? (
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
+              <rect x="3" y="2" width="3" height="10" rx="1" />
+              <rect x="8" y="2" width="3" height="10" rx="1" />
+            </svg>
+          ) : (
             <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
               <path d="M3 2.5v9l8-4.5z" />
             </svg>
-            Play Audio ({duration}s)
-          </>
-        )}
-      </button>
+          )}
+        </button>
+        <svg className="waveform-bars" viewBox={`0 0 ${NUM_BARS * 4} 32`} preserveAspectRatio="none">
+          {bars.map((h, i) => {
+            const barH = Math.max(2, h * 28);
+            const y = (32 - barH) / 2;
+            return (
+              <rect
+                key={i}
+                x={i * 4}
+                y={y}
+                width="2.5"
+                height={barH}
+                rx="1"
+                className={i < playedBars ? "waveform-bar-played" : "waveform-bar"}
+              />
+            );
+          })}
+        </svg>
+        <span className="waveform-duration">{duration.toFixed(1)}s</span>
+      </div>
     </div>
   );
 }
@@ -318,6 +387,7 @@ export default function App() {
   const [stats, setStats] = useState(null);
   const [cachedModels, setCachedModels] = useState({});
   const [attachedImage, setAttachedImage] = useState(null); // { dataUrl, width, height }
+  const [lightboxSrc, setLightboxSrc] = useState(null);
 
   const workerRef = useRef(null);
   const chatEndRef = useRef(null);
@@ -375,16 +445,28 @@ export default function App() {
         streamRef.current = "";
         break;
       case "token": {
-        streamRef.current += data.text;
-        const text = streamRef.current;
-        // If audio started, show a generating indicator
+        // Audio frame progress update
+        if (data.audioFrame) {
+          setMessages((prev) => {
+            const updated = [...prev];
+            const idx = updated.findLastIndex((m) => m.role === "audio-pending");
+            if (idx >= 0) updated[idx] = { ...updated[idx], frameCount: data.audioFrame };
+            return updated;
+          });
+          setStats({ tokensPerSec: data.tokensPerSec, tokenCount: data.tokenCount });
+          break;
+        }
+        // Audio started — add pending indicator
         if (data.audioStarted) {
           setMessages((prev) => [
             ...prev,
-            { role: "audio-pending", content: "Generating speech..." },
+            { role: "audio-pending", content: "Generating speech...", frameCount: 0 },
           ]);
           break;
         }
+        // Normal text token
+        streamRef.current += data.text;
+        const text = streamRef.current;
         setMessages((prev) => {
           const updated = [...prev];
           const last = updated[updated.length - 1];
@@ -683,7 +765,8 @@ export default function App() {
                           <img
                             src={msg.image.dataUrl}
                             alt="Attached"
-                            className="max-w-[200px] max-h-[200px] rounded-lg mb-2 object-contain"
+                            className="chat-image-thumb"
+                            onClick={() => setLightboxSrc(msg.image.dataUrl)}
                           />
                         )}
                         <div className="whitespace-pre-wrap">{msg.content}</div>
@@ -695,8 +778,14 @@ export default function App() {
                     ) : msg.role === "audio" ? (
                       <AudioMessage key={i} waveform={msg.waveform} sampleRate={msg.sampleRate} />
                     ) : msg.role === "audio-pending" ? (
-                      <div key={i} className="message message-assistant">
-                        <span className="text-neutral-400 text-xs font-medium">Generating speech</span>
+                      <div key={i} className="message message-assistant audio-pending">
+                        <div className="flex items-center gap-2">
+                          <span className="audio-pulse-icon" />
+                          <span className="text-neutral-500 text-xs font-medium">Generating speech</span>
+                          {msg.frameCount > 0 && (
+                            <span className="text-neutral-300 text-xs font-mono">frame {msg.frameCount}</span>
+                          )}
+                        </div>
                         <PulseDots />
                       </div>
                     ) : (
@@ -707,7 +796,7 @@ export default function App() {
                       />
                     )
                   )}
-                  {generating && messages[messages.length - 1]?.role !== "assistant" && (
+                  {generating && !["assistant", "audio-pending"].includes(messages[messages.length - 1]?.role) && (
                     <div className="message message-assistant">
                       <PulseDots />
                     </div>
@@ -792,6 +881,8 @@ export default function App() {
           </div>
         )}
       </section>
+
+      {lightboxSrc && <ImageLightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
     </div>
   );
 }

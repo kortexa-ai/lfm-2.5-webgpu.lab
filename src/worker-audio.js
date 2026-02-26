@@ -39,13 +39,10 @@ async function cachedFetch(url, label) {
 
   // Check cache first
   const cached = await cache.match(stableUrl);
-  if (cached) {
-    console.log("[worker-audio] cache hit:", stableUrl);
-    return cached.arrayBuffer();
-  }
+  if (cached) return cached.arrayBuffer();
 
   // Fetch with progress
-  console.log("[worker-audio] downloading:", stableUrl);
+  console.log("[worker-audio] downloading:", label || stableUrl);
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status}`);
 
@@ -312,15 +309,11 @@ async function decodeAudioCodes(audioCodes) {
     }
   }
 
-  console.log("[worker-audio] decoding", numFrames, "audio frames");
-
   const detokOut = await detokenizer.run({
     audio_codes: new ort.Tensor("int64", codesArray, [1, NUM_CODEBOOKS, numFrames]),
   });
 
   const outputNames = Object.keys(detokOut);
-  console.log("[worker-audio] detokenizer outputs:", outputNames, outputNames.map((n) => detokOut[n].dims));
-
   const stftFeatures = detokOut.stft_features || detokOut[outputNames[0]];
   const dims = stftFeatures.dims;
   const stftData = stftFeatures.data;
@@ -328,15 +321,6 @@ async function decodeAudioCodes(audioCodes) {
   // stft_features shape: [1, T_stft, 1282] where 1282 = 2 * 641 (log_magnitude + phase)
   const tStft = dims[1];
   const featureDim = dims[2];
-  console.log("[worker-audio] STFT: %d frames, %d features (expected %d)", tStft, featureDim, ISTFT_N_FREQ * 2);
-
-  // Log first frame's STFT values for diagnostics
-  if (tStft > 0) {
-    const logMag0 = stftData[0], logMag1 = stftData[1], logMag640 = stftData[640];
-    const angle0 = stftData[ISTFT_N_FREQ], angle1 = stftData[ISTFT_N_FREQ + 1];
-    console.log("[worker-audio] STFT frame 0 sample: logMag[0..2,640]=[%.4f,%.4f,%.4f] angle[0..1]=[%.4f,%.4f]",
-      logMag0, logMag1, logMag640, angle0, angle1);
-  }
 
   // Reconstruct waveform via overlap-add ISTFT
   // Matches reference: Liquid4All/onnx-export infer.py _istft_same_padding()
@@ -432,24 +416,19 @@ self.onmessage = async (e) => {
       const embedMeta = JSON.parse(new TextDecoder().decode(embedMetaBuf));
       embedWeight = new Float32Array(embedBuf);
       embedHiddenSize = embedMeta.hidden_size;
-      console.log("[worker-audio] embed_tokens: vocab_size=%d, hidden_size=%d", embedMeta.vocab_size, embedHiddenSize);
+      console.log("[worker-audio] embed_tokens: vocab=%d, dim=%d", embedMeta.vocab_size, embedHiddenSize);
 
       self.postMessage({ type: "status", data: "Loading decoder (q4, ~1.5GB)..." });
       decoder = await loadSession("decoder_q4", 1, "Decoder q4");
-      console.log("[worker-audio] decoder inputNames:", decoder.inputNames);
-      console.log("[worker-audio] decoder outputNames:", decoder.outputNames);
 
       self.postMessage({ type: "status", data: "Loading audio embedding (q4)..." });
       audioEmbedding = await loadSession("audio_embedding_q4", 1, "Audio embedding q4");
-      console.log("[worker-audio] audioEmbedding inputNames:", audioEmbedding.inputNames);
 
       self.postMessage({ type: "status", data: "Loading detokenizer (q4)..." });
       detokenizer = await loadSession("audio_detokenizer_q4", 1, "Detokenizer q4");
 
       self.postMessage({ type: "status", data: "Loading depthformer (q4)..." });
       depthformer = await loadSession("vocoder_depthformer_q4", 1, "Depthformer q4");
-      console.log("[worker-audio] depthformer inputNames:", depthformer.inputNames);
-      console.log("[worker-audio] depthformer outputNames:", depthformer.outputNames);
 
       self.postMessage({ type: "loaded" });
     } catch (err) {
@@ -480,16 +459,13 @@ self.onmessage = async (e) => {
       prompt += "<|im_start|>assistant\n";
       const inputIds = tokenizer.encode(prompt);
 
-      console.log("[worker-audio] prompt:", JSON.stringify(prompt));
-      console.log("[worker-audio] inputIds:", inputIds.length, "tokens");
+      console.log("[worker-audio] prompt: %d tokens", inputIds.length);
       self.postMessage({
         type: "generate_start",
         data: { promptTokens: inputIds.length },
       });
 
-      // Get initial embeddings
       let embeds = getTextEmbeddings(inputIds);
-      console.log("[worker-audio] embeds shape:", embeds.dims, "dtype:", embeds.type);
       let curLen = inputIds.length;
 
       const cache = initCache();
@@ -509,14 +485,11 @@ self.onmessage = async (e) => {
           [1, curLen]
         );
 
-        console.log("[worker-audio] step %d: running decoder (curLen=%d, embeds=%s)...", step, curLen, embeds.dims);
-        const t0 = performance.now();
         const outputs = await decoder.run({
           inputs_embeds: embeds,
           attention_mask: attentionMask,
           ...cache,
         });
-        console.log("[worker-audio] step %d: decoder done in %.1fs, outputs: %s", step, (performance.now() - t0) / 1000, Object.keys(outputs));
 
         updateCache(cache, outputs);
 
@@ -531,9 +504,7 @@ self.onmessage = async (e) => {
           // Extract last hidden state
           const lastHidden = hiddenStates.data.slice(-HIDDEN_SIZE);
 
-          // Generate one audio frame (8 codebook values)
           const frameCodes = await generateAudioFrame(lastHidden);
-          console.log("[worker-audio] audio frame", audioCodes.length, "codes:", frameCodes);
 
           // Check for end-of-audio
           if (frameCodes[0] === AUDIO_END_TOKEN) {
@@ -573,11 +544,8 @@ self.onmessage = async (e) => {
           // Text generation mode
           const nextToken = argmaxLast(outputs.logits);
           totalTokens++;
-          const decoded = tokenizer.decode([nextToken], { skip_special_tokens: false });
-          console.log("[worker-audio] step %d: token=%d decoded=%s", step, nextToken, JSON.stringify(decoded));
-
           if (nextToken === AUDIO_START_TOKEN_ID) {
-            console.log("[worker-audio] <|audio_start|> detected, switching to audio mode");
+            console.log("[worker-audio] <|audio_start|> — switching to audio mode");
             inAudioMode = true;
             self.postMessage({
               type: "token",

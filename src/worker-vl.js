@@ -36,13 +36,10 @@ async function cachedFetch(url, label) {
 
   // Check cache first
   const cached = await cache.match(stableUrl);
-  if (cached) {
-    console.log("[worker-vl] cache hit:", stableUrl);
-    return cached.arrayBuffer();
-  }
+  if (cached) return cached.arrayBuffer();
 
   // Fetch with progress
-  console.log("[worker-vl] downloading:", stableUrl);
+  console.log("[worker-vl] downloading:", label || stableUrl);
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status}`);
 
@@ -278,14 +275,9 @@ self.onmessage = async (e) => {
 
       self.postMessage({ type: "status", data: "Loading image encoder (q4)..." });
       embedImages = await loadSession("embed_images_q4", 1, "Image encoder q4");
-      console.log("[worker-vl] embedImages inputNames:", embedImages.inputNames);
-      console.log("[worker-vl] embedImages outputNames:", embedImages.outputNames);
 
       self.postMessage({ type: "status", data: "Loading decoder (q4, ~1.2GB)..." });
       decoder = await loadSession("decoder_q4", 1, "Decoder q4");
-
-      console.log("[worker-vl] decoder inputNames:", decoder.inputNames);
-      console.log("[worker-vl] decoder outputNames:", decoder.outputNames);
 
       self.postMessage({ type: "loaded" });
     } catch (err) {
@@ -312,7 +304,6 @@ self.onmessage = async (e) => {
       if (imageMsg && embedImages) {
         self.postMessage({ type: "status", data: "Processing image..." });
         const imgTensors = await preprocessImage(imageMsg.image);
-        console.log("[worker-vl] running embed_images, patches:", imgTensors.totalPatches);
 
         const imgOut = await embedImages.run({
           pixel_values: imgTensors.pixelValues,
@@ -323,7 +314,7 @@ self.onmessage = async (e) => {
         const outName = Object.keys(imgOut)[0];
         imageEmbeds = imgOut[outName];
         numImageTokens = imageEmbeds.dims[0];
-        console.log("[worker-vl] image embeddings:", imageEmbeds.dims, "→", numImageTokens, "image tokens");
+        console.log("[worker-vl] image → %d tokens", numImageTokens);
       }
 
       // Build prompt manually — tokenizer has no chat_template set
@@ -338,7 +329,7 @@ self.onmessage = async (e) => {
       prompt += "<|im_start|>assistant\n";
       const inputIds = tokenizer.encode(prompt);
 
-      console.log("[worker-vl] prompt length:", inputIds.length, "tokens (%d image tokens)", numImageTokens);
+      console.log("[worker-vl] prompt: %d tokens (%d image)", inputIds.length, numImageTokens);
       self.postMessage({
         type: "generate_start",
         data: { promptTokens: inputIds.length },
@@ -362,7 +353,7 @@ self.onmessage = async (e) => {
             imgIdx++;
           }
         }
-        console.log("[worker-vl] merged %d image embeddings into text", imgIdx);
+        console.log("[worker-vl] merged %d image embeddings", imgIdx);
       }
 
       let curLen = inputIds.length;
