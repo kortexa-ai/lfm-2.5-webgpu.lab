@@ -10,8 +10,18 @@ const NUM_KV_HEADS = 8;
 const HEAD_DIM = 64; // 2048 / 32
 const CONV_CACHE_LEN = 3;
 
+// Vision constants (from processor_config.json)
+const PATCH_SIZE = 16;
+const DOWNSAMPLE_FACTOR = 2;
+const GRID_UNIT = PATCH_SIZE * DOWNSAMPLE_FACTOR; // 32
+const MAX_IMAGE_TOKENS = 256;
+const MIN_IMAGE_TOKENS = 64;
+const MAX_PATCHES_PER_TILE = 1024; // (512/16)^2
+const IMAGE_TOKEN_ID = 396; // <image> token
+
 let tokenizer = null;
 let embedTokens = null;
+let embedImages = null;
 let decoder = null;
 
 ort.env.wasm.numThreads = 1;
@@ -114,6 +124,93 @@ async function getTextEmbeddings(ids) {
   return out.inputs_embeds;
 }
 
+// Smart resize: find dimensions that are multiples of 32, within token budget, preserving aspect ratio
+function smartResize(w, h) {
+  let cols = Math.ceil(w / GRID_UNIT);
+  let rows = Math.ceil(h / GRID_UNIT);
+  let tokens = cols * rows;
+
+  if (tokens > MAX_IMAGE_TOKENS) {
+    const scale = Math.sqrt(MAX_IMAGE_TOKENS / tokens);
+    cols = Math.max(1, Math.round(cols * scale));
+    rows = Math.max(1, Math.round(rows * scale));
+  } else if (tokens < MIN_IMAGE_TOKENS) {
+    const scale = Math.sqrt(MIN_IMAGE_TOKENS / tokens);
+    cols = Math.max(1, Math.round(cols * scale));
+    rows = Math.max(1, Math.round(rows * scale));
+  }
+
+  return [cols * GRID_UNIT, rows * GRID_UNIT];
+}
+
+// Preprocess image dataUrl → tensors for embed_images
+// Returns { pixelValues, pixelAttentionMask, spatialShapes, patchRows, patchCols }
+async function preprocessImage(dataUrl) {
+  // Decode image in worker via fetch + createImageBitmap
+  const response = await fetch(dataUrl);
+  const blob = await response.blob();
+
+  // Get original dimensions
+  const origBitmap = await createImageBitmap(blob);
+  const origW = origBitmap.width, origH = origBitmap.height;
+  const [newW, newH] = smartResize(origW, origH);
+  origBitmap.close();
+
+  console.log("[worker-vl] image resize: %dx%d → %dx%d", origW, origH, newW, newH);
+
+  // Resize and draw to OffscreenCanvas
+  const bitmap = await createImageBitmap(blob, { resizeWidth: newW, resizeHeight: newH, resizeQuality: "high" });
+  const canvas = new OffscreenCanvas(newW, newH);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+
+  const imageData = ctx.getImageData(0, 0, newW, newH);
+  const pixels = imageData.data; // Uint8ClampedArray RGBA
+
+  // Extract 16×16 patches and normalize
+  const patchRows = newH / PATCH_SIZE;
+  const patchCols = newW / PATCH_SIZE;
+  const totalPatches = patchRows * patchCols;
+
+  // Padded to MAX_PATCHES_PER_TILE
+  const pixelValues = new Float32Array(MAX_PATCHES_PER_TILE * 768);
+
+  for (let pr = 0; pr < patchRows; pr++) {
+    for (let pc = 0; pc < patchCols; pc++) {
+      const patchIdx = pr * patchCols + pc;
+      const patchOffset = patchIdx * 768;
+      let k = 0;
+
+      // Extract 16×16 patch, RGB only, normalized to [-1, 1]
+      for (let py = 0; py < PATCH_SIZE; py++) {
+        for (let px = 0; px < PATCH_SIZE; px++) {
+          const imgX = pc * PATCH_SIZE + px;
+          const imgY = pr * PATCH_SIZE + py;
+          const rgbaIdx = (imgY * newW + imgX) * 4;
+          pixelValues[patchOffset + k++] = pixels[rgbaIdx] / 127.5 - 1.0;     // R
+          pixelValues[patchOffset + k++] = pixels[rgbaIdx + 1] / 127.5 - 1.0; // G
+          pixelValues[patchOffset + k++] = pixels[rgbaIdx + 2] / 127.5 - 1.0; // B
+        }
+      }
+    }
+  }
+
+  // Attention mask: 1 for valid patches, 0 for padding
+  const attentionMask = new BigInt64Array(MAX_PATCHES_PER_TILE);
+  for (let i = 0; i < totalPatches; i++) attentionMask[i] = 1n;
+
+  // Spatial shapes: [patchRows, patchCols]
+  const spatialShapes = new BigInt64Array([BigInt(patchRows), BigInt(patchCols)]);
+
+  return {
+    pixelValues: new ort.Tensor("float32", pixelValues, [1, MAX_PATCHES_PER_TILE, 768]),
+    pixelAttentionMask: new ort.Tensor("int64", attentionMask, [1, MAX_PATCHES_PER_TILE]),
+    spatialShapes: new ort.Tensor("int64", spatialShapes, [1, 2]),
+    totalPatches,
+  };
+}
+
 // Initialize KV cache — dynamically from decoder input names
 function initCache() {
   const cache = {};
@@ -179,6 +276,11 @@ self.onmessage = async (e) => {
       self.postMessage({ type: "status", data: "Loading text embeddings (fp16)..." });
       embedTokens = await loadSession("embed_tokens_fp16", 1, "Embed tokens fp16");
 
+      self.postMessage({ type: "status", data: "Loading image encoder (q4)..." });
+      embedImages = await loadSession("embed_images_q4", 1, "Image encoder q4");
+      console.log("[worker-vl] embedImages inputNames:", embedImages.inputNames);
+      console.log("[worker-vl] embedImages outputNames:", embedImages.outputNames);
+
       self.postMessage({ type: "status", data: "Loading decoder (q4, ~1.2GB)..." });
       decoder = await loadSession("decoder_q4", 1, "Decoder q4");
 
@@ -202,21 +304,67 @@ self.onmessage = async (e) => {
     try {
       const messages = data.messages || [];
 
-      // Build prompt using chat template
-      const prompt = tokenizer.apply_chat_template(messages, {
-        add_generation_prompt: true,
-        tokenize: false,
-      });
+      // Check if any message has an image
+      const imageMsg = messages.find((m) => m.image);
+      let imageEmbeds = null;
+      let numImageTokens = 0;
+
+      if (imageMsg && embedImages) {
+        self.postMessage({ type: "status", data: "Processing image..." });
+        const imgTensors = await preprocessImage(imageMsg.image);
+        console.log("[worker-vl] running embed_images, patches:", imgTensors.totalPatches);
+
+        const imgOut = await embedImages.run({
+          pixel_values: imgTensors.pixelValues,
+          pixel_attention_mask: imgTensors.pixelAttentionMask,
+          spatial_shapes: imgTensors.spatialShapes,
+        });
+
+        const outName = Object.keys(imgOut)[0];
+        imageEmbeds = imgOut[outName];
+        numImageTokens = imageEmbeds.dims[0];
+        console.log("[worker-vl] image embeddings:", imageEmbeds.dims, "→", numImageTokens, "image tokens");
+      }
+
+      // Build prompt manually — tokenizer has no chat_template set
+      let prompt = "<|startoftext|>";
+      prompt += "<|im_start|>system\nYou are a helpful multimodal assistant by Liquid AI.<|im_end|>\n";
+      for (const msg of messages) {
+        if (msg.role === "system") continue;
+        // Insert <image> tokens before text for the message that has an image
+        const imagePrefix = (msg.image && numImageTokens > 0) ? "<image>".repeat(numImageTokens) : "";
+        prompt += `<|im_start|>${msg.role}\n${imagePrefix}${msg.content}<|im_end|>\n`;
+      }
+      prompt += "<|im_start|>assistant\n";
       const inputIds = tokenizer.encode(prompt);
 
-      console.log("[worker-vl] prompt length:", inputIds.length, "tokens");
+      console.log("[worker-vl] prompt length:", inputIds.length, "tokens (%d image tokens)", numImageTokens);
       self.postMessage({
         type: "generate_start",
         data: { promptTokens: inputIds.length },
       });
 
-      // Get initial embeddings for all input tokens
+      // Get text embeddings, then merge image embeddings at <image> positions
       let embeds = await getTextEmbeddings(inputIds);
+
+      if (imageEmbeds && numImageTokens > 0) {
+        // Replace <image> token positions with image embeddings
+        const embedsData = embeds.data; // Float32Array [1, seqLen, 2048]
+        const imgData = imageEmbeds.data; // Float32Array [numImageTokens, 2048]
+        let imgIdx = 0;
+        for (let i = 0; i < inputIds.length && imgIdx < numImageTokens; i++) {
+          if (inputIds[i] === IMAGE_TOKEN_ID) {
+            const dst = i * HIDDEN_SIZE;
+            const src = imgIdx * HIDDEN_SIZE;
+            for (let j = 0; j < HIDDEN_SIZE; j++) {
+              embedsData[dst + j] = imgData[src + j];
+            }
+            imgIdx++;
+          }
+        }
+        console.log("[worker-vl] merged %d image embeddings into text", imgIdx);
+      }
+
       let curLen = inputIds.length;
 
       const cache = initCache();

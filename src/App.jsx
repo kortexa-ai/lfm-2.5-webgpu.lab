@@ -12,8 +12,8 @@ const MODELS = [
     id: "LiquidAI/LFM2.5-VL-1.6B-ONNX",
     type: "vl",
     label: "VL 1.6B",
-    desc: "Vision-language text chat",
-    size: "~1.5GB",
+    desc: "Vision-language with image understanding",
+    size: "~1.7GB",
   },
   {
     id: "LiquidAI/LFM2.5-Audio-1.5B-ONNX",
@@ -317,13 +317,33 @@ export default function App() {
   const [generating, setGenerating] = useState(false);
   const [stats, setStats] = useState(null);
   const [cachedModels, setCachedModels] = useState({});
+  const [attachedImage, setAttachedImage] = useState(null); // { dataUrl, width, height }
 
   const workerRef = useRef(null);
   const chatEndRef = useRef(null);
   const inputRef = useRef(null);
   const streamRef = useRef("");
+  const fileInputRef = useRef(null);
 
   const modelInfo = getModelInfo(modelId);
+  const isVL = modelInfo.type === "vl";
+
+  // Attach image from File object
+  const attachImage = useCallback((file) => {
+    if (!file || !file.type.startsWith("image/")) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        setAttachedImage({ dataUrl: e.target.result, width: img.width, height: img.height });
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  }, []);
+
+  // Clear attached image when switching models
+  useEffect(() => { setAttachedImage(null); }, [modelId]);
 
   // Check cache status for all models on mount and after loading completes
   useEffect(() => {
@@ -482,9 +502,15 @@ export default function App() {
     const text = input.trim();
     if (!text || generating || status !== "ready") return;
 
-    const newMessages = [...messages, { role: "user", content: text }];
+    // Build user message — include image if attached
+    const userMsg = attachedImage
+      ? { role: "user", content: text, image: attachedImage }
+      : { role: "user", content: text };
+
+    const newMessages = [...messages, userMsg];
     setMessages(newMessages);
     setInput("");
+    setAttachedImage(null);
     setGenerating(true);
     setStats(null);
 
@@ -494,12 +520,12 @@ export default function App() {
       data: {
         messages: newMessages
           .filter((m) => ["user", "assistant", "system", "tool"].includes(m.role))
-          .map(({ role, content }) => ({ role, content })),
+          .map(({ role, content, image }) => ({ role, content, ...(image ? { image: image.dataUrl } : {}) })),
         maxTokens: 2048,
         temperature: 0.7,
       },
     });
-  }, [input, generating, status, messages]);
+  }, [input, generating, status, messages, attachedImage]);
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -507,6 +533,20 @@ export default function App() {
       sendMessage();
     }
   };
+
+  // Paste image from clipboard
+  const handlePaste = useCallback((e) => {
+    if (!isVL) return;
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type.startsWith("image/")) {
+        e.preventDefault();
+        attachImage(item.getAsFile());
+        return;
+      }
+    }
+  }, [isVL, attachImage]);
 
   const hasWebGPU = checkWebGPU();
   const mobile = isMobile();
@@ -626,7 +666,11 @@ export default function App() {
                 )}
 
                 {/* Messages */}
-                <div className="chat-container min-h-[200px] max-h-[60vh] overflow-y-auto panel">
+                <div
+                  className="chat-container min-h-[200px] max-h-[60vh] overflow-y-auto panel"
+                  onDragOver={isVL ? (e) => e.preventDefault() : undefined}
+                  onDrop={isVL ? (e) => { e.preventDefault(); attachImage(e.dataTransfer.files[0]); } : undefined}
+                >
                   {messages.length === 0 && (
                     <p className="text-sm text-neutral-400 text-center py-8">
                       Model loaded. Type something to start chatting.
@@ -635,6 +679,13 @@ export default function App() {
                   {messages.map((msg, i) =>
                     msg.role === "user" ? (
                       <div key={i} className="message message-user">
+                        {msg.image && (
+                          <img
+                            src={msg.image.dataUrl}
+                            alt="Attached"
+                            className="max-w-[200px] max-h-[200px] rounded-lg mb-2 object-contain"
+                          />
+                        )}
                         <div className="whitespace-pre-wrap">{msg.content}</div>
                       </div>
                     ) : msg.role === "tool" ? (
@@ -664,14 +715,66 @@ export default function App() {
                   <div ref={chatEndRef} />
                 </div>
 
+                {/* Image preview */}
+                {attachedImage && (
+                  <div className="flex items-start gap-3 px-4 py-3 bg-neutral-50 border border-neutral-200 rounded-xl">
+                    <img
+                      src={attachedImage.dataUrl}
+                      alt="Preview"
+                      className="w-16 h-16 rounded-lg object-cover"
+                    />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs text-neutral-500">
+                        {attachedImage.width} × {attachedImage.height}
+                      </div>
+                      {(attachedImage.width > 512 || attachedImage.height > 512) && (
+                        <div className="text-xs text-amber-600 mt-1">
+                          Image exceeds 512×512 — will be resized for the model
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => setAttachedImage(null)}
+                      className="text-neutral-400 hover:text-neutral-600 text-lg leading-none"
+                      title="Remove image"
+                    >
+                      ×
+                    </button>
+                  </div>
+                )}
+
                 {/* Input */}
                 <div className="flex gap-3">
+                  {isVL && (
+                    <>
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => { attachImage(e.target.files[0]); e.target.value = ""; }}
+                      />
+                      <button
+                        onClick={() => fileInputRef.current?.click()}
+                        disabled={generating}
+                        className="px-3 py-3.5 bg-white border border-neutral-200 rounded-xl hover:bg-neutral-50 transition-colors disabled:opacity-40 text-neutral-500"
+                        title="Attach image (or paste from clipboard)"
+                      >
+                        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                          <rect x="2" y="2" width="14" height="14" rx="2" />
+                          <circle cx="6" cy="7" r="1.5" />
+                          <path d="M2 13l4-4 3 3 2-2 5 5" />
+                        </svg>
+                      </button>
+                    </>
+                  )}
                   <textarea
                     ref={inputRef}
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyDown={handleKeyDown}
-                    placeholder="Type a message..."
+                    onPaste={handlePaste}
+                    placeholder={isVL ? "Type a message... (paste or attach image)" : "Type a message..."}
                     disabled={generating}
                     rows={1}
                     className="flex-1 px-5 py-3.5 bg-white border border-neutral-200 rounded-xl resize-none focus:outline-none focus:border-neutral-400 transition-colors disabled:opacity-50 text-sm"
