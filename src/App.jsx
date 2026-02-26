@@ -239,6 +239,11 @@ export default function App() {
 
   // Create worker on mount and check cache
   useEffect(() => {
+    if (isMobile()) {
+      setStatus("idle");
+      return;
+    }
+
     if (!checkWebGPU()) {
       setStatus("error");
       setStatusText("WebGPU is not supported in this browser. Try Chrome 113+ or Edge 113+.");
@@ -323,7 +328,7 @@ export default function App() {
         )}
 
         {/* Status / Loader */}
-        {status === "idle" && (
+        {!mobile && status === "idle" && (
           <div className="panel text-center space-y-4">
             <div className="space-y-2">
               <p className="text-sm text-neutral-500">
