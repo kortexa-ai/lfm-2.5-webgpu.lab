@@ -53,7 +53,7 @@ function parseThinking(content) {
   }
 
   if (!content.includes("<think>")) {
-    return { thinking: null, reply: content, thinkingDone: true };
+    return { thinking: null, reply: cleanSpecialTokens(content), thinkingDone: true };
   }
 
   const afterOpen = content.split("<think>")[1];
@@ -61,11 +61,21 @@ function parseThinking(content) {
   // </think> is present — split thinking from reply
   if (afterOpen.includes("</think>")) {
     const [thinking, ...rest] = afterOpen.split("</think>");
-    return { thinking: thinking.trim(), reply: rest.join("</think>").trim(), thinkingDone: true };
+    return { thinking: cleanSpecialTokens(thinking.trim()), reply: cleanSpecialTokens(rest.join("</think>").trim()), thinkingDone: true };
   }
 
   // Still streaming thinking content
-  return { thinking: afterOpen.trim(), reply: "", thinkingDone: false };
+  return { thinking: cleanSpecialTokens(afterOpen.trim()), reply: "", thinkingDone: false };
+}
+
+// Strip tool call markers and other special tokens from displayed text
+function cleanSpecialTokens(text) {
+  return text
+    .replace(/<\|tool_call_start\|>[\s\S]*?<\|tool_call_end\|>/g, "")
+    .replace(/<\|tool_call_start\|>[\s\S]*/g, "") // partial, still streaming
+    .replace(/<\|[a-z_]+\|>/g, "") // any remaining special tokens like <|im_end|>
+    .replace(/◁[a-z_]+▷/g, "") // alternate rendering of special tokens
+    .trim();
 }
 
 function ThinkingBlock({ thinking }) {
@@ -103,6 +113,10 @@ function AssistantMessage({ content, isStreaming }) {
     );
   }
 
+  // Debug: detect if content has tool markers or is suspiciously empty
+  const hasToolMarkers = content.includes("<|tool_call") || content.includes("tool_call");
+  const isEmpty = !reply && !isStreaming && !thinking;
+
   return (
     <div className="message message-assistant">
       {thinking && <ThinkingBlock thinking={thinking} />}
@@ -111,12 +125,21 @@ function AssistantMessage({ content, isStreaming }) {
       ) : (
         isStreaming && <PulseDots />
       )}
+      {(isEmpty || hasToolMarkers) && !isStreaming && (
+        <div className="mt-2 text-[10px] text-neutral-300 font-mono break-all border-t border-neutral-100 pt-2">
+          raw: {JSON.stringify(content).slice(0, 500)}
+        </div>
+      )}
     </div>
   );
 }
 
 function checkWebGPU() {
   return typeof navigator !== "undefined" && "gpu" in navigator;
+}
+
+function isMobile() {
+  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 }
 
 export default function App() {
@@ -175,6 +198,17 @@ export default function App() {
         setStats({ tokensPerSec: data.tokensPerSec, tokenCount: data.tokenCount });
         break;
       }
+      case "tool_call":
+        // Show tool execution in chat
+        setMessages((prev) => [
+          ...prev,
+          { role: "tool", content: `Called ${data.call.name}(${Object.entries(data.call.args).map(([k, v]) => `${k}="${v}"`).join(", ")})`, result: data.result },
+        ]);
+        break;
+      case "tool_continue":
+        // Reset stream for the continuation after tool result
+        streamRef.current = "";
+        break;
       case "generate_done":
         setGenerating(false);
         setStats({
@@ -240,7 +274,7 @@ export default function App() {
       type: "generate",
       data: {
         messages: newMessages.map(({ role, content }) => ({ role, content })),
-        maxTokens: 512,
+        maxTokens: 2048,
         temperature: 0.7,
       },
     });
@@ -254,22 +288,34 @@ export default function App() {
   };
 
   const hasWebGPU = checkWebGPU();
+  const mobile = isMobile();
 
   return (
     <div className="page">
       <LabHeader />
 
-      <section className="hero pt-20 pb-4">
+      <section className="hero pt-24 pb-4">
         <p className="eyebrow">In-Browser AI</p>
-        <h1 className="title">LFM 2.5 WebGPU</h1>
+        <h1 className="title">LiquidAI LFM 2.5 WebGPU</h1>
         <p className="lede">
           Run Liquid AI's LFM 2.5 1.2B Thinking entirely in your browser. No server, no API keys — just WebGPU.
         </p>
       </section>
 
       <section className="content">
+        {/* Mobile block */}
+        {mobile && (
+          <div className="panel text-center space-y-3">
+            <p className="text-lg font-semibold">Desktop Required</p>
+            <p className="text-sm text-neutral-500">
+              Loading a 1.2B parameter model needs more memory than mobile browsers can handle.
+              Try this on a desktop with Chrome or Edge.
+            </p>
+          </div>
+        )}
+
         {/* Checking cache */}
-        {status === "checking" && (
+        {!mobile && status === "checking" && (
           <div className="panel text-center">
             <span className="text-sm text-neutral-500">Checking for cached model</span>
             <PulseDots />
@@ -359,6 +405,10 @@ export default function App() {
                 msg.role === "user" ? (
                   <div key={i} className="message message-user">
                     <div className="whitespace-pre-wrap">{msg.content}</div>
+                  </div>
+                ) : msg.role === "tool" ? (
+                  <div key={i} className="message message-tool">
+                    <span className="tool-label">tool</span> {msg.content}
                   </div>
                 ) : (
                   <AssistantMessage

@@ -66,6 +66,15 @@
   @apply bg-amber-50 border border-amber-200 text-amber-800 self-center text-sm text-center;
 }
 
+.message-tool {
+  @apply bg-violet-50 border border-violet-200 text-violet-700 self-center text-xs font-mono rounded-lg px-3 py-2;
+  animation: fade-up 0.3s ease-out;
+}
+
+.tool-label {
+  @apply inline-block bg-violet-200 text-violet-800 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider mr-1;
+}
+
 /* Thinking block */
 .think-block {
   @apply border-b border-neutral-100 pb-3;
