@@ -6,8 +6,7 @@ import {
 
 let tokenizer = null;
 let model = null;
-
-const MODEL_ID = "LiquidAI/LFM2.5-1.2B-Thinking-ONNX";
+let loadedModelId = null;
 
 const TOOLS = [
   {
@@ -45,7 +44,6 @@ function parseToolCalls(text) {
       const name = fnMatch[1];
       const argsStr = fnMatch[2];
       const args = {};
-      // Parse key="value" pairs
       const argPattern = /(\w+)\s*=\s*"([^"]*)"/g;
       let argMatch;
       while ((argMatch = argPattern.exec(argsStr)) !== null) {
@@ -79,18 +77,28 @@ async function isModelCached(modelId) {
 
 self.onmessage = async (e) => {
   const { type, data } = e.data;
+  const modelId = data?.modelId;
 
   if (type === "check") {
-    const cached = await isModelCached(data?.modelId || MODEL_ID);
+    if (!modelId) {
+      self.postMessage({ type: "cache_status", data: { cached: false } });
+      return;
+    }
+    const cached = await isModelCached(modelId);
     self.postMessage({ type: "cache_status", data: { cached } });
     return;
   }
 
   if (type === "load") {
+    if (!modelId) {
+      self.postMessage({ type: "error", data: "No model ID provided" });
+      return;
+    }
+
     try {
       self.postMessage({ type: "status", data: "Loading tokenizer..." });
 
-      tokenizer = await AutoTokenizer.from_pretrained(data?.modelId || MODEL_ID, {
+      tokenizer = await AutoTokenizer.from_pretrained(modelId, {
         progress_callback: (progress) => {
           self.postMessage({ type: "progress", data: progress });
         },
@@ -98,7 +106,7 @@ self.onmessage = async (e) => {
 
       self.postMessage({ type: "status", data: "Loading model with WebGPU..." });
 
-      model = await AutoModelForCausalLM.from_pretrained(data?.modelId || MODEL_ID, {
+      model = await AutoModelForCausalLM.from_pretrained(modelId, {
         device: "webgpu",
         dtype: data?.dtype || "q4f16",
         progress_callback: (progress) => {
@@ -106,6 +114,7 @@ self.onmessage = async (e) => {
         },
       });
 
+      loadedModelId = modelId;
       self.postMessage({ type: "loaded" });
     } catch (err) {
       self.postMessage({ type: "error", data: err.message });
