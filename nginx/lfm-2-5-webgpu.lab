@@ -4,6 +4,6 @@ location = /lfm-2-5-webgpu {
 }
 
 location /lfm-2-5-webgpu/ {
-    alias /Users/francip/src/lfm-2.5-webgpu.lab/dist/;
+    alias /home/francip/src/lfm-2.5-webgpu.lab/dist/;
     try_files $uri $uri/ /lfm-2-5-webgpu/index.html;
 }
