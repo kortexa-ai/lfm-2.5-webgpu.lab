@@ -7,6 +7,19 @@ import {
 let tokenizer = null;
 let model = null;
 let loadedModelId = null;
+let chatTemplate = null;
+
+// Some LFM2.5 chat templates (e.g. the 230M) wrap assistant turns in
+// `{% generation %}` / `{% endgeneration %}` — a training-time masking hint that
+// transformers.js's Jinja engine doesn't implement ("Unknown statement type:
+// generation"). Stripping the tags (any whitespace-control form) leaves the rendered
+// inference prompt identical. The tag close (`%}`) must follow `generation` directly,
+// so `add_generation_prompt` (followed by `_prompt`) is never matched. Harmless no-op
+// for templates that don't use the tag.
+function sanitizeChatTemplate(template) {
+  if (typeof template !== "string") return null;
+  return template.replace(/\{%[-+]?\s*(?:end)?generation\s*[-+]?%\}/g, "");
+}
 
 const TOOLS = [
   {
@@ -103,6 +116,7 @@ self.onmessage = async (e) => {
           self.postMessage({ type: "progress", data: progress });
         },
       });
+      chatTemplate = sanitizeChatTemplate(tokenizer.chat_template);
 
       self.postMessage({ type: "status", data: "Loading model with WebGPU..." });
 
@@ -144,6 +158,7 @@ self.onmessage = async (e) => {
         const inputs = tokenizer.apply_chat_template(messages, {
           add_generation_prompt: true,
           return_dict: true,
+          ...(chatTemplate ? { chat_template: chatTemplate } : {}),
         });
 
         if (round === 0) {
